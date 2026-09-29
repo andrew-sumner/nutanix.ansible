@@ -27,6 +27,11 @@ DOCUMENTATION = r"""
                 - Prism central hostname or IP address
                 - If not provided, values will be taken from environment variables NUTANIX_HOSTNAME or NUTANIX_HOST
                 - If both are set, NUTANIX_HOSTNAME is preferred over NUTANIX_HOST
+                - If neither is set, the host is taken from the NUTANIX_ENDPOINT environment variable, for
+                  alignment with the Nutanix Terraform provider. It accepts a hostname, IP, C(host:port) or URL
+                  (e.g. C(https://prism.example.com:9440)); an IPv6 address must be in brackets
+                  (e.g. C([fd00::1]:9440)). A port in it is used only when neither C(nutanix_port) nor NUTANIX_PORT is set.
+                  Only the v2 inventory plugins read NUTANIX_ENDPOINT; modules and lookups do not.
             required: false
             type: str
             env:
@@ -36,6 +41,10 @@ DOCUMENTATION = r"""
             description:
                 - Prism central username
                 - If not provided, values will be taken from environment variable NUTANIX_USERNAME
+                - A value in the inventory file may be a Jinja2 expression, such as a lookup
+                  (e.g. C({{ lookup('community.general.onepassword', 'Nutanix', field='username') }})).
+                  Values from environment variables and vault-encrypted values are used as-is;
+                  mark a plain value C(!unsafe) to keep it literal.
             required: false
             type: str
             env:
@@ -44,6 +53,9 @@ DOCUMENTATION = r"""
             description:
                 - Prism central password
                 - If not provided, values will be taken from environment variable NUTANIX_PASSWORD
+                - A value in the inventory file may be a Jinja2 expression, such as a lookup.
+                  Values from environment variables and vault-encrypted values are used as-is;
+                  mark a plain value C(!unsafe) to keep it literal.
             required: false
             type: str
             env:
@@ -62,6 +74,9 @@ DOCUMENTATION = r"""
             description:
                 - Prism central API key
                 - If not provided, values will be taken from environment variable NUTANIX_API_KEY
+                - A value in the inventory file may be a Jinja2 expression, such as a lookup.
+                  Values from environment variables and vault-encrypted values are used as-is;
+                  mark a plain value C(!unsafe) to keep it literal.
             required: false
             type: str
             env:
@@ -73,6 +88,8 @@ DOCUMENTATION = r"""
                 - Headers can also be supplied via environment variables using the NUTANIX_HEADER_
                   prefix (e.g. NUTANIX_HEADER_CF_ACCESS_CLIENT_ID becomes Cf-Access-Client-Id).
                   Inventory file values take precedence over environment variables.
+                - Values in the inventory file may be Jinja2 expressions, such as lookups.
+                  Vault-encrypted and C(!unsafe) values are used as-is.
             required: false
             type: dict
         fetch_all_hosts:
@@ -205,11 +222,15 @@ import tempfile  # noqa: E402
 from ansible.errors import AnsibleError  # noqa: E402
 from ansible.plugins.inventory import BaseInventoryPlugin, Constructable  # noqa: E402
 
+from ..module_utils.utils import parse_nutanix_endpoint  # noqa: E402
 from ..module_utils.v4.clusters_mgmt.api_client import (  # noqa: E402
     get_clusters_api_instance,
 )
 from ..module_utils.v4.utils import strip_internal_attributes  # noqa: E402
-from ..plugin_utils.inventory_utils import get_hostname  # noqa: E402
+from ..plugin_utils.inventory_utils import (  # noqa: E402
+    get_hostname,
+    template_file_option,
+)
 
 
 class Mock_Module:
@@ -434,9 +455,36 @@ class InventoryModule(BaseInventoryPlugin, Constructable):
                 return False
         return True
 
+    def _template_option(self, option_name):
+        """
+        Return an option, templating it only when it was given as plain text in
+        the inventory file (e.g. a lookup for a secret). See template_file_option.
+        """
+        return template_file_option(
+            self.templar, self._file_config, option_name, self.get_option(option_name)
+        )
+
+    def _apply_nutanix_endpoint(self):
+        """
+        Take the host from NUTANIX_ENDPOINT, for alignment with the Terraform provider.
+        A port in it applies only when nutanix_port was not set explicitly.
+        """
+        try:
+            endpoint_host, endpoint_port = parse_nutanix_endpoint(
+                os.environ.get("NUTANIX_ENDPOINT")
+            )
+        except ValueError as e:
+            raise AnsibleError(str(e))
+        self.nutanix_host = endpoint_host
+        port_set = self._file_config.get("nutanix_port") is not None or bool(
+            os.environ.get("NUTANIX_PORT")
+        )
+        if endpoint_port and not port_set:
+            self.nutanix_port = str(endpoint_port)
+
     def parse(self, inventory, loader, path, cache=True):
         super().parse(inventory, loader, path, cache=cache)
-        self._read_config_data(path)
+        self._file_config = self._read_config_data(path) or {}
 
         # Get configuration options from inventory file or environment variables
         self.nutanix_host = (
@@ -444,27 +492,31 @@ class InventoryModule(BaseInventoryPlugin, Constructable):
             or os.environ.get("NUTANIX_HOSTNAME")
             or os.environ.get("NUTANIX_HOST")
         )
-        self.nutanix_username = self.get_option("nutanix_username") or os.environ.get(
-            "NUTANIX_USERNAME"
-        )
-        self.nutanix_password = self.get_option("nutanix_password") or os.environ.get(
-            "NUTANIX_PASSWORD"
-        )
+        self.nutanix_username = self._template_option(
+            "nutanix_username"
+        ) or os.environ.get("NUTANIX_USERNAME")
+        self.nutanix_password = self._template_option(
+            "nutanix_password"
+        ) or os.environ.get("NUTANIX_PASSWORD")
         self.nutanix_port = self.get_option("nutanix_port") or os.environ.get(
             "NUTANIX_PORT", "9440"
         )
-        _raw_api_key = self.get_option("nutanix_api_key") or os.environ.get(
+        if not self.nutanix_host:
+            self._apply_nutanix_endpoint()
+        _raw_api_key = self._template_option("nutanix_api_key") or os.environ.get(
             "NUTANIX_API_KEY"
         )
-        # Convert to plain str: get_option() may return a str subclass, which the
-        # SDK's set_api_key rejects (it checks `type(key) is str`).
-        self.nutanix_api_key = str(_raw_api_key) if _raw_api_key else None
-        self.custom_headers = self.get_option("custom_headers")
+        # Convert to plain str: get_option() and templating may return a str
+        # subclass, for which the SDK's set_api_key silently stores None (it checks
+        # `type(key) is str`). str() keeps some subclasses (AnsibleUnsafeText
+        # before ansible-core 2.19); join always builds a plain str.
+        self.nutanix_api_key = "".join([_raw_api_key]) if _raw_api_key else None
+        self.custom_headers = self._template_option("custom_headers")
 
         # Validate required parameters
         if not self.nutanix_host:
             raise AnsibleError(
-                "nutanix_host must be provided either in inventory file or as NUTANIX_HOSTNAME environment variable or NUTANIX_HOST environment variable"
+                "nutanix_host must be provided either in inventory file or as NUTANIX_HOSTNAME, NUTANIX_HOST or NUTANIX_ENDPOINT environment variable"
             )
         if (
             not self.nutanix_username or not self.nutanix_password

@@ -7,6 +7,11 @@ import os
 
 from ansible.module_utils.common.text.converters import to_text
 
+try:
+    from urllib.parse import urlparse
+except ImportError:
+    from urlparse import urlparse
+
 __metaclass__ = type
 
 
@@ -44,6 +49,38 @@ def get_custom_headers(module_params):
             del custom_headers[existing]
         custom_headers[name] = value if value is None else to_text(value)
     return custom_headers
+
+
+def parse_nutanix_endpoint(endpoint):
+    """
+    Split a NUTANIX_ENDPOINT value into (host, port), for alignment with the Nutanix
+    Terraform provider. Accepts a hostname or IP, host:port, [IPv6]:port, or a URL such
+    as https://prism.example.com:9440. port is None when the value does not include one.
+    An IPv6 host is returned in brackets, ready to be used in a URL.
+
+    Raises ValueError for a value that cannot be read unambiguously: an IPv6 address
+    without brackets, or a port that is not a number from 1 to 65535.
+    """
+    value = (endpoint or "").strip()
+    if not value:
+        return None, None
+    if "://" not in value:
+        value = "https://" + value
+    parsed = urlparse(value)
+    if not parsed.netloc.startswith("[") and parsed.netloc.count(":") > 1:
+        raise ValueError(
+            "IPv6 address in NUTANIX_ENDPOINT must be in brackets, e.g. [fd00::1]:9440"
+        )
+    try:
+        port = parsed.port
+    except ValueError:
+        port = 0
+    if port == 0 or (parsed.netloc.endswith(":") and port is None):
+        raise ValueError("invalid port in NUTANIX_ENDPOINT")
+    host = parsed.hostname
+    if host and ":" in host:
+        host = "[{0}]".format(host)
+    return host, port
 
 
 def remove_param_with_none_value(d):
